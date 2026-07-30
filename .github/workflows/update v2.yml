@@ -1,7 +1,12 @@
 name: 보드 갱신
 
 on:
-  workflow_dispatch:          # ← 폰에서 누르는 "Run workflow" 버튼
+  workflow_dispatch:          # 폰에서 누르는 "Run workflow" 버튼
+  push:                       # 코드를 고치면 자동 재실행
+    branches: [main]
+    paths:                    # docs/ 는 제외 — 워크플로 자신의 커밋으로 무한루프 방지
+      - "board.py"
+      - ".github/workflows/update.yml"
   schedule:
     # UTC 기준. 아래는 한국시간 07~24시대 30분 간격(평일).
     # 주의: GitHub cron은 최소 5분 간격이며 실제로는 수 분씩 밀린다. 정시 보장 없음.
@@ -25,6 +30,11 @@ jobs:
           python-version: "3.12"
 
       - run: pip install --quiet yfinance
+
+      - name: 버전 지문 확인
+        run: |
+          echo "STALE_LIMIT 존재 여부:"; grep -c "STALE_LIMIT" board.py || echo "0 (구버전!)"
+          echo "밀 배율 존재 여부:";     grep -c "mult=0.01"  board.py || echo "0 (구버전!)"
 
       - name: 수집 및 렌더
         env:
