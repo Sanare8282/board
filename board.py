@@ -34,6 +34,7 @@ CN = ("Asia/Shanghai", 930, 1500)
 TW = ("Asia/Taipei", 900, 1330)
 CME = ("America/Chicago", 1700, 1600)
 DLY = ("America/New_York", 0, 0)      # 일별 확정 시계열 (장중 개념 없음)
+DLY_KR = ("Asia/Seoul", 0, 0)         # 한국 일별 시계열
 
 I = lambda **k: k
 INDICATORS = [
@@ -60,12 +61,12 @@ INDICATORS = [
     I(key="twii", g="아시아지수", ko="대만 가권 지수",  en="TAIWAN WEIGHTED",    src="yf", t="^TWII",     u="pt", dp=2, s=TW),
 
     # ── 한국 국채금리 (6) · ECOS_KEY 필요
-    I(key="kr2y",  g="한국 국채금리", ko="한국 국채 2년",  en="KR BOND 2Y",  src="ecos", t="010200000", u="%", dp=2, s=DLY),
-    I(key="kr3y",  g="한국 국채금리", ko="한국 국채 3년",  en="KR BOND 3Y",  src="ecos", t="010200001", u="%", dp=2, s=DLY),
-    I(key="kr5y",  g="한국 국채금리", ko="한국 국채 5년",  en="KR BOND 5Y",  src="ecos", t="010200002", u="%", dp=2, s=DLY),
-    I(key="kr10y", g="한국 국채금리", ko="한국 국채 10년", en="KR BOND 10Y", src="ecos", t="010210000", u="%", dp=2, s=DLY),
-    I(key="kr20y", g="한국 국채금리", ko="한국 국채 20년", en="KR BOND 20Y", src="ecos", t="010220000", u="%", dp=2, s=DLY),
-    I(key="kr30y", g="한국 국채금리", ko="한국 국채 30년", en="KR BOND 30Y", src="ecos", t="010230000", u="%", dp=2, s=DLY),
+    I(key="kr2y",  g="한국 국채금리", ko="한국 국채 2년",  en="KR BOND 2Y",  src="ecos", t="2년", u="%", dp=2, s=DLY_KR),
+    I(key="kr3y",  g="한국 국채금리", ko="한국 국채 3년",  en="KR BOND 3Y",  src="ecos", t="3년", u="%", dp=2, s=DLY_KR),
+    I(key="kr5y",  g="한국 국채금리", ko="한국 국채 5년",  en="KR BOND 5Y",  src="ecos", t="5년", u="%", dp=2, s=DLY_KR),
+    I(key="kr10y", g="한국 국채금리", ko="한국 국채 10년", en="KR BOND 10Y", src="ecos", t="10년", u="%", dp=2, s=DLY_KR),
+    I(key="kr20y", g="한국 국채금리", ko="한국 국채 20년", en="KR BOND 20Y", src="ecos", t="20년", u="%", dp=2, s=DLY_KR),
+    I(key="kr30y", g="한국 국채금리", ko="한국 국채 30년", en="KR BOND 30Y", src="ecos", t="30년", u="%", dp=2, s=DLY_KR),
 
     # ── 미국 국채금리 (4)
     I(key="us2y",  g="미국 국채금리", ko="미국 국채 2년",  en="US TREASURY 2Y",  src="fred", t="DGS2", u="%", dp=2, s=DLY),
@@ -173,22 +174,67 @@ def fetch_fred(spec):
     raise RuntimeError(f"4회 재시도 실패: {str(last)[:80]}")
 
 
-def fetch_ecos(spec):
+_ECOS_CACHE = {}
+
+
+def _ecos_get(url, timeout=45):
     import urllib.request
+    req = urllib.request.Request(url, headers={"User-Agent": "market-board/4.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _ecos_raise(data):
+    """ECOS는 오류를 RESULT.CODE/MESSAGE로 돌려준다. 원문을 그대로 노출한다."""
+    if isinstance(data, dict) and "RESULT" in data:
+        rs = data["RESULT"]
+        raise RuntimeError(f"ECOS {rs.get('CODE','?')}: {rs.get('MESSAGE','')}"[:170])
+
+
+def ecos_items(key, table):
+    """항목코드를 추측하지 않고 ECOS에서 직접 받아온다.
+    받은 목록은 Actions 로그에 찍어 다음 수정의 근거로 남긴다."""
+    if table in _ECOS_CACHE:
+        return _ECOS_CACHE[table]
+    data = _ecos_get(f"https://ecos.bok.or.kr/api/StatisticItemList/{key}/json/kr/1/500/{table}")
+    _ecos_raise(data)
+    if "StatisticItemList" not in data:
+        raise RuntimeError(f"항목목록 응답 이상: {str(data)[:130]}")
+    items = {}
+    for row in data["StatisticItemList"]["row"]:
+        nm, cd = row.get("ITEM_NAME", ""), row.get("ITEM_CODE", "")
+        if nm and cd:
+            items.setdefault(nm.strip(), cd)
+    print(f"[ecos] {table} 항목 {len(items)}개 발견: "
+          f"{', '.join(list(items)[:25])}", file=sys.stderr)
+    _ECOS_CACHE[table] = items
+    return items
+
+
+def fetch_ecos(spec):
     key = os.environ.get("ECOS_KEY", "").strip()
     if not key:
         raise RuntimeError("ECOS_KEY 미설정")
-    end = datetime.now(KST); start = end - timedelta(days=25)
-    url = (f"https://ecos.bok.or.kr/api/StatisticSearch/{key}/json/kr/1/50/817Y002/D/"
-           f"{start:%Y%m%d}/{end:%Y%m%d}/{spec['t']}")
-    req = urllib.request.Request(url, headers={"User-Agent": "market-board/2.0"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        data = json.loads(r.read().decode("utf-8"))
+    table = os.environ.get("ECOS_TABLE", "817Y002").strip()
+
+    items = ecos_items(key, table)
+    want = spec["t"]                       # 예: "2년"
+    cands = [(n, c) for n, c in items.items() if "국고채" in n and want in n]
+    if not cands:
+        cands = [(n, c) for n, c in items.items() if want in n]
+    if not cands:
+        raise RuntimeError(f"'{want}' 항목 미발견. 사용가능: {', '.join(list(items)[:10])}")
+    name, code = sorted(cands, key=lambda x: len(x[0]))[0]
+
+    end = datetime.now(KST); start = end - timedelta(days=30)
+    data = _ecos_get(f"https://ecos.bok.or.kr/api/StatisticSearch/{key}/json/kr/1/100/"
+                     f"{table}/D/{start:%Y%m%d}/{end:%Y%m%d}/{code}")
+    _ecos_raise(data)
     if "StatisticSearch" not in data:
-        raise RuntimeError(f"ECOS 응답 이상: {str(data)[:100]}")
+        raise RuntimeError(f"조회 응답 이상: {str(data)[:130]}")
     rows = [x for x in data["StatisticSearch"]["row"] if x.get("DATA_VALUE")]
     if len(rows) < 2:
-        raise RuntimeError("유효 관측치 2개 미만")
+        raise RuntimeError(f"'{name}'({code}) 유효 관측치 2개 미만")
     d = rows[-1]["TIME"]; iso = f"{d[0:4]}-{d[4:6]}-{d[6:8]}"
     return float(rows[-1]["DATA_VALUE"]), float(rows[-2]["DATA_VALUE"]), iso, iso
 
