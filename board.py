@@ -80,7 +80,8 @@ INDICATORS = [
     I(key="silver", g="실물원자재", ko="은",        en="SILVER",         src="yf", t="SI=F", u="$/oz",    dp=2, s=CME),
     I(key="natgas", g="실물원자재", ko="천연가스",  en="NATURAL GAS",    src="yf", t="NG=F", u="$/MMBtu", dp=3, s=CME),
     I(key="copper", g="실물원자재", ko="구리",      en="COPPER",         src="yf", t="HG=F", u="$/lb",    dp=3, s=CME),
-    I(key="wheat",  g="실물원자재", ko="밀",        en="WHEAT",          src="yf", t="ZW=F", u="$/bu",    dp=2, s=CME),
+    I(key="wheat",  g="실물원자재", ko="밀",        en="WHEAT",          src="yf", t="ZW=F", u="$/bu",    dp=2, s=CME,
+      mult=0.01, note="ZW=F는 부셸당 센트 호가. 100으로 나눠 달러 환산한 값"),
 
     # ── 야간선물 (2) · 무료 소스 없음. 임의 대체하지 않는다.
     I(key="k200n",  g="야간선물", ko="코스피200 야간",  en="KOSPI 200 NIGHT",  src="none", t="", u="pt", dp=2, s=KRX,
@@ -141,15 +142,35 @@ def fetch_yf(spec):
 
 
 def fetch_fred(spec):
-    import urllib.request
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={spec['t']}"
-    req = urllib.request.Request(url, headers={"User-Agent": "market-board/2.0"})
-    with urllib.request.urlopen(req, timeout=30) as r:
-        rows = list(csv.reader(io.StringIO(r.read().decode("utf-8"))))
-    body = [x for x in rows[1:] if len(x) >= 2 and x[1] not in (".", "")]
-    if len(body) < 2:
-        raise RuntimeError("유효 관측치 2개 미만")
-    return float(body[-1][1]), float(body[-2][1]), body[-1][0], body[-1][0]
+    """GitHub 러너에서 FRED 응답이 느려 타임아웃이 잦다. 재시도 + 대체 경로."""
+    import time, urllib.request
+    urls = [f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={spec['t']}",
+            f"https://fred.stlouisfed.org/data/{spec['t']}.txt"]
+    last = None
+    for attempt in range(4):
+        url = urls[attempt % len(urls)]
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) market-board/3.0",
+                "Accept": "text/csv,text/plain,*/*", "Accept-Encoding": "identity"})
+            with urllib.request.urlopen(req, timeout=75) as r:
+                text = r.read().decode("utf-8", "replace")
+            if url.endswith(".txt"):          # 고정폭 텍스트 형식
+                body = []
+                for ln in text.splitlines():
+                    p = ln.split()
+                    if len(p) == 2 and p[0][:4].isdigit() and p[1] != ".":
+                        body.append([p[0], p[1]])
+            else:                              # CSV 형식
+                rows = list(csv.reader(io.StringIO(text)))
+                body = [x for x in rows[1:] if len(x) >= 2 and x[1] not in (".", "")]
+            if len(body) < 2:
+                raise RuntimeError("유효 관측치 2개 미만")
+            return float(body[-1][1]), float(body[-2][1]), body[-1][0], body[-1][0]
+        except Exception as e:
+            last = e
+            time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"4회 재시도 실패: {str(last)[:80]}")
 
 
 def fetch_ecos(spec):
@@ -186,7 +207,7 @@ MOCK = {"kospi": 5663.24, "kosdaq": 662.68, "dxy": 101.33, "usdkrw": 1446.98,
         "sse": 3820.64, "twii": 40039.18, "kr2y": 3.71, "kr3y": 3.83, "kr5y": 4.07,
         "kr10y": 4.29, "kr20y": 4.53, "kr30y": 4.54, "us2y": 4.25, "us5y": 4.36,
         "us10y": 4.60, "us30y": 5.10, "brent": 86.10, "wti": 82.35, "gold": 4039.20,
-        "silver": 58.12, "natgas": 2.70, "copper": 6.33, "wheat": 6.70, "move": 118.4,
+        "silver": 58.12, "natgas": 2.70, "copper": 6.33, "wheat": 670.0, "move": 118.4,
         "hyoas": 3.42, "igoas": 1.05, "sofr": 4.33, "iorb": 4.40,
         "hyg": 78.90, "ief": 94.10, "kre": 72.30}
 
@@ -210,6 +231,24 @@ def fetch_mock(spec):
     return base, round(base / 1.004, 6), d.strftime("%Y-%m-%d"), d.strftime("%Y-%m-%d")
 
 
+def biz_age(bar_date, tzname):
+    """기준일부터 시장 현지 오늘까지 경과 영업일. 공휴일은 반영하지 않는다(추정)."""
+    try:
+        d = datetime.strptime(str(bar_date)[:10], "%Y-%m-%d").date()
+    except Exception:
+        return None
+    today = (datetime.now(ZoneInfo(tzname)) if ZoneInfo else datetime.now(KST)).date()
+    n = 0
+    while d < today:
+        d += timedelta(days=1)
+        if d.weekday() < 5:
+            n += 1
+    return n
+
+
+STALE_LIMIT = 3   # 영업일. 이 이상 묵으면 '정상'이 아니라 '지연'으로 강등한다.
+
+
 def collect(mock, prev_state):
     now = datetime.now(KST); out = []
     for sp in INDICATORS:
@@ -221,10 +260,16 @@ def collect(mock, prev_state):
             r["note"] = sp["note"]
         try:
             val, prev, bar, asof = (fetch_mock if mock else FETCH[sp["src"]])(sp)
-            r.update(status="정상", value=round(val, sp["dp"]), prev_close=round(prev, sp["dp"]),
+            m = sp.get("mult", 1.0)
+            val, prev = val * m, prev * m
+            age = biz_age(bar, sp["s"][0])
+            stale = age is not None and age >= STALE_LIMIT
+            r.update(status="정상(지연)" if stale else "정상",
+                     value=round(val, sp["dp"]), prev_close=round(prev, sp["dp"]),
                      change=round(val - prev, sp["dp"]),
                      change_pct=round((val - prev) / prev * 100, 2) if prev else None,
-                     basis=judge_basis(sp["s"], bar), basis_date=bar, source_asof=asof)
+                     basis=judge_basis(sp["s"], bar), basis_date=bar, source_asof=asof,
+                     age_bizdays=age)
         except Exception as e:
             # 실패 행에는 값을 절대 넣지 않는다. 마지막 성공 '시각'만 남긴다.
             r.update(status="수집실패", value=None, prev_close=None, change=None,
@@ -303,7 +348,8 @@ def render_txt(rows, gen, mock):
           "빈 항목을 다른 항목으로 메우지 말 것.",
           "4. 실패 항목에는 마지막 성공 '시각'만 있고 값은 없다. 의도된 설계다.",
           "5. `기준일`과 `소스기준시각`이 다르면 소스기준시각이 원본이다. 역산값을 믿지 말 것.",
-          "6. 장중/종가 판정은 거래시간 기준 **추정**이며 휴장일을 반영하지 않는다.", "",
+          "6. 상태가 **정상(지연)** 이면 값이 오래된 것이다. 현재 상태의 근거로 쓰지 말 것.",
+          "7. 장중/종가 판정은 거래시간 기준 **추정**이며 휴장일을 반영하지 않는다.", "",
           "## 수집 실패 목록", ""]
     if not bad:
         L.append("없음.")
@@ -312,17 +358,39 @@ def render_txt(rows, gen, mock):
         for r in bad:
             L.append(f"| {r['ko']} | {r.get('fail_reason','-')} | {r.get('last_success_at') or '기록 없음'} |")
     L.append("")
+    stale = [r for r in rows if r["status"] == "정상(지연)"]
+    L += ["## 지연 항목 (값은 있으나 오래됨)", ""]
+    if not stale:
+        L.append("없음.")
+    else:
+        L.append(f"아래 {len(stale)}건은 기준일이 {STALE_LIMIT}영업일 이상 지났다. "
+                 "값이 있어도 **현재 상태의 근거로 쓰지 말 것.**")
+        L += ["", "| 지표 | 값 | 기준일 | 경과(영업일) |", "|---|---|---|---|"]
+        for r in stale:
+            L.append(f"| {r['ko']} | {fmt(r)} {r['unit']} | {r['basis_date']} | {r.get('age_bizdays')} |")
+    L.append("")
     for g in GROUP_ORDER:
         grp = [r for r in rows if r["group"] == g]
         if not grp:
             continue
-        L += [f"## {g}", "",
-              "| 지표 | 값 | 전일대비 | 기준 | 기준일 | 소스기준시각 | 출처 | 상태 |",
+        L += [f"## {g}", ""]
+        dates = {}
+        for r in grp:
+            if r["basis_date"]:
+                dates[r["basis_date"]] = dates.get(r["basis_date"], 0) + 1
+        if len(dates) > 1:
+            dist = ", ".join(f"{k} {v}건" for k, v in sorted(dates.items()))
+            L += [f"> 기준일 불일치: {dist}. 같은 그룹인데 기준일이 다르면 "
+                  "서로 다른 세션의 값이다. 직접 비교하지 말 것.", ""]
+        L += ["| 지표 | 값 | 전일대비 | 기준 | 기준일 | 소스기준시각 | 출처 | 상태 |",
               "|---|---|---|---|---|---|---|---|"]
         for r in grp:
+            st = r["status"]
+            if st == "정상(지연)":
+                st = f"정상(지연 {r.get('age_bizdays')}영업일)"
             L.append(f"| {r['ko']} ({r['en']}) | {fmt(r)} {r['unit'] if r['value'] is not None else ''} "
                      f"| {fmt_chg(r)} | {r['basis'] or '—'} | {r['basis_date'] or '—'} "
-                     f"| {r.get('source_asof') or '—'} | {r['source']} | {r['status']} |")
+                     f"| {r.get('source_asof') or '—'} | {r['source']} | {st} |")
         L.append("")
         for r in grp:
             if r.get("note"):
@@ -366,7 +434,8 @@ border-style:dashed;border-color:#3a2733}
 font:10px/1.6 ui-monospace,monospace;color:var(--dim);display:flex;justify-content:space-between;
 gap:8px;flex-wrap:wrap}
 .badge{border:1px solid currentColor;border-radius:4px;padding:0 5px;font-size:9px}
-.b-live{color:var(--stamp)}.b-fix{color:#4fb286}.b-drv{color:#9b8cff}
+.b-live{color:var(--stamp)}.b-fix{color:#4fb286}.b-drv{color:#9b8cff}.b-stale{color:#ff9f43}
+.card.stale{border-color:#7a4a12;background:#1a1509}
 .failmsg{font:11px/1.6 ui-monospace,monospace;color:#c78b8b;margin-top:12px}
 .failmsg .lbl{color:#ff8f8f}
 footer{margin-top:38px;padding-top:14px;border-top:1px solid var(--line);
@@ -390,6 +459,13 @@ def render_html(rows, gen, mock):
     H.append("모든 숫자에 출처·기준·소스기준시각이 붙습니다. 빈 카드는 확인하지 못한 항목입니다.")
     H.append("</div><div class='links'><a href='./now.txt'>LLM용 now.txt</a>"
              "<a href='./now.json'>now.json</a></div></header>")
+    stale = [r for r in rows if r["status"] == "정상(지연)"]
+    if stale:
+        H.append("<div class='alert' style='border-color:#7a4a12;background:#1a1509'>"
+                 "<h2 style='color:#ff9f43'>오래된 값 (현재 상태의 근거로 쓰지 말 것)</h2><ul>")
+        for r in stale:
+            H.append(f"<li>{r['ko']} — 기준일 {r['basis_date']}, {r.get('age_bizdays')}영업일 경과</li>")
+        H.append("</ul></div>")
     if bad:
         H.append("<div class='alert'><h2>확인하지 못한 항목</h2><ul>")
         for r in bad:
@@ -412,10 +488,14 @@ def render_html(rows, gen, mock):
             c = "flat" if r["change"] == 0 else ("up" if r["change"] > 0 else "dn")
             ar = "▲" if r["change"] > 0 else ("▼" if r["change"] < 0 else "―")
             bc = {"장중": "b-live", "종가확정": "b-fix", "일별확정": "b-fix"}.get(r["basis"], "b-drv")
-            H.append(f"<div class='card'><div class='nm'>{r['ko']}</div><div class='tk'>{r['en']}</div>"
+            st = r["status"] == "정상(지연)"
+            if st:
+                bc = "b-stale"
+            H.append(f"<div class='card{' stale' if st else ''}'><div class='nm'>{r['ko']}</div><div class='tk'>{r['en']}</div>"
                      f"<div class='val'>{fmt(r)}<span class='u'>{r['unit']}</span></div>"
                      f"<div class='chg {c}'>{ar} {fmt_chg(r)}</div>"
-                     f"<div class='stamp'><span class='badge {bc}'>{r['basis']}</span>"
+                     f"<div class='stamp'><span class='badge {bc}'>"
+                     f"{'지연 ' + str(r.get('age_bizdays')) + '영업일' if st else r['basis']}</span>"
                      f"<span>{r['source']} · {r.get('source_asof') or r['basis_date']}</span></div></div>")
         H.append("</div>")
     H.append("<footer>자동 수집 · 사람 검수 없음. 매매 판단 전 원본 시세를 다시 확인하세요.</footer>")
