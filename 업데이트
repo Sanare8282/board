@@ -1,0 +1,41 @@
+name: 보드 갱신
+
+on:
+  workflow_dispatch:          # ← 폰에서 누르는 "Run workflow" 버튼
+  schedule:
+    # UTC 기준. 아래는 한국시간 07~24시대 30분 간격(평일).
+    # 주의: GitHub cron은 최소 5분 간격이며 실제로는 수 분씩 밀린다. 정시 보장 없음.
+    - cron: "0,30 22-23,0-15 * * 1-5"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: board
+  cancel-in-progress: true
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet yfinance
+
+      - name: 수집 및 렌더
+        env:
+          ECOS_KEY: ${{ secrets.ECOS_KEY }}   # 없으면 한국 국채금리만 '수집실패'로 표기됨
+          TZ: Asia/Seoul
+        run: python board.py --out docs
+
+      - name: 결과 커밋
+        run: |
+          git config user.name  "market-board"
+          git config user.email "actions@users.noreply.github.com"
+          git add docs
+          git diff --staged --quiet || git commit -m "갱신 $(TZ=Asia/Seoul date '+%m-%d %H:%M KST')"
+          git push
